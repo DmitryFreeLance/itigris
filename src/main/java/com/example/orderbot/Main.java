@@ -13,27 +13,21 @@ public class Main {
     private static final Logger log = LoggerFactory.getLogger(Main.class);
 
     public static void main(String[] args) throws Exception {
-        // ==== ЛОКАЛЬНЫЕ НАСТРОЙКИ (без env) ====
-        final String BOT_TOKEN = ""; // <-- подставьте токен
-        final String DB_PATH = "./data/bot.db";
+        // ====== ENV-ПЕРЕМЕННЫЕ ======
+        final String BOT_TOKEN           = envRequired("BOT_TOKEN");
+        final String ITIGRIS_CLIENT      = envRequired("ITIGRIS_CLIENT");
+        final String ITIGRIS_API_KEY     = envRequired("ITIGRIS_API_KEY");
 
-        // Уфа (UTC+5): корректный ZoneId — Asia/Yekaterinburg
-        final String TZ = "Asia/Yekaterinburg";
+        final String DB_PATH             = envOrDefault("DB_PATH", "/data/bot.db");
+        final String TZ                  = envOrDefault("TZ", "Asia/Yekaterinburg"); // Уфа
 
-        // Itigris (ваши данные):
-        final String ITIGRIS_CLIENT = "azbuka_zreniya";
-        final String ITIGRIS_API_KEY = "5fc36abf93d4c67aef8231741c23f629";
+        final int    SCAN_INTERVAL_MIN   = intEnv("SCAN_INTERVAL_MINUTES", 15);
+        final int    REMINDER_WINDOW_MIN = intEnv("REMINDER_WINDOW_MINUTES", 60);
+        final double REMINDER_LEAD_HOURS = doubleEnv("REMINDER_LEAD_HOURS", 72.0);
 
-        // Планировщик (для теста: часто сканируем, широкое окно):
-        final int SCAN_INTERVAL_MINUTES = 1;    // как часто сканировать
-        final int REMINDER_WINDOW_MINUTES = 5;  // окно добора вокруг lead-часов
-
-        // Лиду-тайм напоминания, ЧАСЫ.
-        // ТЕСТ: 0.05 (~3 минуты). БОЕВОЙ: 72.
-        final double REMINDER_LEAD_HOURS = 72;
-
-        // ==== ИНИЦ ====
+        // ====== ИНИЦ СИСТЕМЫ ======
         ZoneId zoneId = ZoneId.of(TZ);
+
         Path dbFile = Path.of(DB_PATH);
         Path dbDir = dbFile.getParent();
         if (dbDir != null) Files.createDirectories(dbDir);
@@ -53,12 +47,38 @@ public class Main {
 
         ReminderScheduler scheduler = new ReminderScheduler(
                 repo, itigris, bot, zoneId,
-                SCAN_INTERVAL_MINUTES, REMINDER_WINDOW_MINUTES,
+                SCAN_INTERVAL_MIN, REMINDER_WINDOW_MIN,
                 REMINDER_LEAD_HOURS
         );
         scheduler.start();
 
-        log.info("Bot started (LOCAL TEST). TZ={}, DB={}, scanEvery={}m, window={}m, leadHours={}",
-                TZ, DB_PATH, SCAN_INTERVAL_MINUTES, REMINDER_WINDOW_MINUTES, REMINDER_LEAD_HOURS);
+        log.info("Bot started (Docker/ENV). TZ={}, DB={}, scanEvery={}m, window=±{}m, leadHours={}",
+                TZ, DB_PATH, SCAN_INTERVAL_MIN, REMINDER_WINDOW_MIN, REMINDER_LEAD_HOURS);
+    }
+
+    // ===== helpers for env =====
+    private static String envRequired(String key) {
+        String v = System.getenv(key);
+        if (v == null || v.isBlank()) {
+            throw new IllegalStateException("Missing required env: " + key);
+        }
+        return v;
+    }
+
+    private static String envOrDefault(String key, String def) {
+        String v = System.getenv(key);
+        return (v == null || v.isBlank()) ? def : v;
+    }
+
+    private static int intEnv(String key, int def) {
+        String v = System.getenv(key);
+        if (v == null || v.isBlank()) return def;
+        try { return Integer.parseInt(v.trim()); } catch (Exception e) { return def; }
+    }
+
+    private static double doubleEnv(String key, double def) {
+        String v = System.getenv(key);
+        if (v == null || v.isBlank()) return def;
+        try { return Double.parseDouble(v.trim().replace(',', '.')); } catch (Exception e) { return def; }
     }
 }

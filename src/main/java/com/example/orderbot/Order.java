@@ -8,15 +8,16 @@ public record Order(
         String department,
         long dueAtEpochSec,          // реальный срок готовности
         Long groupChatId,
-        String photoFileId,
+        String photoFileId,          // legacy: одна фотка (оставляем для совместимости)
         boolean reminder72hSent,
         String lastKnownStatus,
         Long lastStatusCheckEpochSec,
         long createdAtEpochSec,
-        Long triggerAtEpochSec       // новый: тестовый триггер (epoch sec) для немедленного напоминания
+        Long triggerAtEpochSec,      // тестовый триггер (напомнить через ~5 минут)
+        String mediaJson             // НОВОЕ: JSON-массив медиа [{type:"photo|video", fileId:"..."}]
 ) {
-    public static Order ofNew(String number, String dep, long due, Long chatId, String photoId, Long triggerAt) {
+    public static Order ofNew(String number, String dep, long due, Long chatId, String photoId, Long triggerAt, String mediaJson) {
         return new Order(null, number, dep, due, chatId, photoId, false, null, null,
-                Instant.now().getEpochSecond(), triggerAt);
+                Instant.now().getEpochSecond(), triggerAt, mediaJson);
     }
 }
