@@ -188,15 +188,15 @@ public class BotService {
             Order o = Order.ofNew(number, dep, due, chatId, photoId, null, mediaJson);
             long id = repo.insert(o); // из-за UNIQUE вставка второй раз просто вернёт уже существующий id
 
-            // подтверждение — отправляем ОДИН раз
+            // подтверждение — только текст, без пересылки медиа
             Order saved = new Order(id, o.orderNumber(), o.department(), o.dueAtEpochSec(), o.groupChatId(),
                     o.photoFileId(), o.reminder72hSent(), o.lastKnownStatus(), o.lastStatusCheckEpochSec(),
                     o.createdAtEpochSec(), o.triggerAtEpochSec(), o.mediaJson());
             String confirm = MessageTemplates.confirmSaved(saved, zone);
 
-            if (!media.isEmpty()) sendReminderWithMedia(saved, confirm);
-            else if (photoId != null) sendPhotoToGroup(chatId, photoId, confirm);
-            else sendToGroup(chatId, confirm);
+// В момент создания заказа не пересылаем фото/видео.
+// Медиа уйдут вместе с напоминанием за 72 часа в ReminderScheduler.
+            sendToGroup(chatId, confirm);
             return;
         }
 
@@ -219,9 +219,8 @@ public class BotService {
                         o.createdAtEpochSec(), o.triggerAtEpochSec(), o.mediaJson());
                 String confirm = MessageTemplates.confirmSaved(saved, zone);
 
-                if (!media.isEmpty()) sendReminderWithMedia(saved, confirm);
-                else if (photoId != null) sendPhotoToGroup(chatId, photoId, confirm);
-                else sendToGroup(chatId, confirm);
+// Подтверждение без медиа — фото/альбом отправятся только в напоминании.
+                sendToGroup(chatId, confirm);
             }
         }
     }
