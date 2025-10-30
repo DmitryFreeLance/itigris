@@ -41,14 +41,26 @@ public class OrderRepository {
                 st.execute("CREATE INDEX IF NOT EXISTS idx_due_at ON orders(due_at)");
                 st.execute("CREATE INDEX IF NOT EXISTS idx_order_number ON orders(order_number)");
 
-                // --- Авто-дедупликация перед созданием UNIQUE ---
-                // Оставляем самую свежую запись (MAX(id)) в каждой группе (chat, order_number, due_at)
+                // Таблица пользователей (приватных и не только) для рассылок
+                st.execute("""
+                    CREATE TABLE IF NOT EXISTS users(
+                      chat_id     INTEGER PRIMARY KEY,
+                      is_private  INTEGER NOT NULL,
+                      username    TEXT,
+                      name        TEXT,
+                      first_seen  INTEGER NOT NULL,
+                      last_seen   INTEGER NOT NULL
+                    )
+                """);
+                st.execute("CREATE INDEX IF NOT EXISTS idx_users_private ON users(is_private)");
+
+                // --- Авто-дедупликация перед созданием UNIQUE по заказам ---
                 int removed = deduplicateByCompositeKey(c);
                 if (removed > 0) {
                     log.warn("Deduplicated {} duplicate rows in orders before creating UNIQUE index", removed);
                 }
 
-                // Пытаемся создать UNIQUE индекс; если вдруг ещё остались дубли (крайне маловероятно) — повторим чистку
+                // Создаём/воссоздаём уникальный индекс
                 try {
                     st.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_chat_order_due ON orders(group_chat_id, order_number, due_at)");
                 } catch (SQLException e) {
@@ -79,7 +91,6 @@ public class OrderRepository {
     /** Удаляет дубликаты по (group_chat_id, order_number, due_at), оставляя MAX(id). Возвращает кол-во удалённых строк. */
     private int deduplicateByCompositeKey(Connection c) throws SQLException {
         try (Statement st = c.createStatement()) {
-            // В temp-CTE собираем id записей, которые надо оставить, затем удаляем все остальные
             String keepCte = """
                 WITH keep AS (
                     SELECT MAX(id) AS id
@@ -201,6 +212,7 @@ public class OrderRepository {
     private Order map(ResultSet rs) throws SQLException {
         Long trig = rs.getObject("trigger_at") == null ? null : rs.getLong("trigger_at");
         String media = rs.getString("media_json");
+        Long lastStatusCheck = rs.getObject("last_status_check_at") == null ? null : rs.getLong("last_status_check_at");
         return new Order(
                 rs.getLong("id"),
                 rs.getString("order_number"),
@@ -210,10 +222,45 @@ public class OrderRepository {
                 rs.getString("photo_file_id"),
                 rs.getInt("reminder72h_sent") == 1,
                 rs.getString("last_status"),
-                rs.getLong("last_status_check_at"),
+                lastStatusCheck,
                 rs.getLong("created_at"),
                 trig,
                 media
         );
+    }
+
+    // ===== Новое: учёт приватных пользователей =====
+
+    /** Сохраняет/обновляет пользователя (используется при каждом приватном сообщении) */
+    public void upsertUser(long chatId, boolean isPrivate, String username, String name) throws SQLException {
+        String sql = """
+          INSERT INTO users(chat_id, is_private, username, name, first_seen, last_seen)
+          VALUES(?,?,?,?, strftime('%s','now'), strftime('%s','now'))
+          ON CONFLICT(chat_id) DO UPDATE SET
+            is_private=excluded.is_private,
+            username=excluded.username,
+            name=excluded.name,
+            last_seen=strftime('%s','now')
+        """;
+        try (Connection c = DriverManager.getConnection(jdbcUrl);
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setLong(1, chatId);
+            ps.setInt(2, isPrivate ? 1 : 0);
+            ps.setString(3, username);
+            ps.setString(4, name);
+            ps.executeUpdate();
+        }
+    }
+
+    /** Возвращает chat_id всех приватных пользователей (для рассылки напоминаний в личку). */
+    public List<Long> findAllPrivateUserChatIds() throws SQLException {
+        String sql = "SELECT chat_id FROM users WHERE is_private=1";
+        List<Long> ids = new ArrayList<>();
+        try (Connection c = DriverManager.getConnection(jdbcUrl);
+             PreparedStatement ps = c.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) ids.add(rs.getLong(1));
+        }
+        return ids;
     }
 }

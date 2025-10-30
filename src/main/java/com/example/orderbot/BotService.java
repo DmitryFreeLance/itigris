@@ -38,7 +38,8 @@ public class BotService {
 
     // агрегация альбомов и дедуп по группам
     private final Map<String, AlbumBucket> albumBuckets = new ConcurrentHashMap<>();
-    private final Set<String> processedMediaGroups = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    // processed media groups с TTL, чтобы не разрасталось бесконечно
+    private final Map<String, Long> processedMediaGroups = new ConcurrentHashMap<>();
     // дедуп по update_id
     private final Set<Integer> seenUpdateIds = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
@@ -55,6 +56,8 @@ public class BotService {
                 long now = System.currentTimeMillis();
                 // очистка старых бакетов альбомов (>= 2 минуты)
                 albumBuckets.entrySet().removeIf(e -> now - e.getValue().createdAtMs > 120_000);
+                // очистка processedMediaGroups (TTL 10 минут)
+                processedMediaGroups.entrySet().removeIf(e -> now - e.getValue() > 10 * 60_000);
                 // контроль разрастания seenUpdateIds
                 if (seenUpdateIds.size() > 5000) {
                     seenUpdateIds.clear();
@@ -78,7 +81,48 @@ public class BotService {
         bot.execute(sp);
     }
 
+    /** НОВОЕ: отправка напоминания в конкретный чат (личка пользователя). */
+    public void sendReminderWithMediaToChat(long chatId, Order o, String captionHtml) {
+        List<MediaItem> media = parseMediaJson(o.mediaJson());
+
+        if (media.isEmpty()) {
+            if (o.photoFileId() != null) sendPhotoToGroup(chatId, o.photoFileId(), captionHtml);
+            else sendToGroup(chatId, captionHtml);
+            return;
+        }
+        if (media.size() == 1) {
+            MediaItem it = media.get(0);
+            if ("video".equals(it.type)) {
+                SendMediaGroup group = new SendMediaGroup(chatId,
+                        new InputMediaVideo(it.fileId).caption(captionHtml).parseMode(ParseMode.HTML));
+                bot.execute(group);
+            } else {
+                sendPhotoToGroup(chatId, it.fileId, captionHtml);
+            }
+            return;
+        }
+        List<InputMedia> ims = new ArrayList<>();
+        for (int i = 0; i < media.size(); i++) {
+            MediaItem it = media.get(i);
+            if ("video".equals(it.type)) {
+                InputMediaVideo im = new InputMediaVideo(it.fileId);
+                if (i == 0) im.caption(captionHtml).parseMode(ParseMode.HTML);
+                ims.add(im);
+            } else {
+                InputMediaPhoto im = new InputMediaPhoto(it.fileId);
+                if (i == 0) im.caption(captionHtml).parseMode(ParseMode.HTML);
+                ims.add(im);
+            }
+        }
+        // батчим по 10 (лимит Telegram для альбома)
+        for (int from = 0; from < ims.size(); from += 10) {
+            int to = Math.min(from + 10, ims.size());
+            bot.execute(new SendMediaGroup(chatId, ims.subList(from, to).toArray(new InputMedia[0])));
+        }
+    }
+
     public void sendReminderWithMedia(Order o, String captionHtml) {
+        // прежний метод оставлен для совместимости (отправляет в groupChatId)
         List<MediaItem> media = parseMediaJson(o.mediaJson());
         long chatId = o.groupChatId();
 
@@ -111,7 +155,10 @@ public class BotService {
                 ims.add(im);
             }
         }
-        bot.execute(new SendMediaGroup(chatId, ims.toArray(new InputMedia[0])));
+        for (int from = 0; from < ims.size(); from += 10) {
+            int to = Math.min(from + 10, ims.size());
+            bot.execute(new SendMediaGroup(chatId, ims.subList(from, to).toArray(new InputMedia[0])));
+        }
     }
 
     private List<MediaItem> parseMediaJson(String json) {
@@ -139,6 +186,19 @@ public class BotService {
         if (m == null || m.chat() == null || m.chat().id() == null) return;
         long chatId = m.chat().id();
 
+        // НОВОЕ: если приватный чат — записываем пользователя в БД (для будущих личных напоминаний)
+        try {
+            boolean isPrivate = m.chat().type() == Chat.Type.Private;
+            String username = m.from() != null ? m.from().username() : null;
+            String name = m.from() != null
+                    ? ((m.from().firstName() == null ? "" : m.from().firstName()) + " " +
+                    (m.from().lastName()  == null ? "" : m.from().lastName())).trim()
+                    : null;
+            repo.upsertUser(chatId, isPrivate, username, name);
+        } catch (Exception e) {
+            log.warn("upsertUser failed for chatId={}: {}", chatId, e.toString());
+        }
+
         // агрегация альбома
         collectAlbumPiece(m);
 
@@ -152,7 +212,9 @@ public class BotService {
             if (b == null) return; // ждём
             long age = System.currentTimeMillis() - b.createdAtMs;
             if (age < 1200L) return; // слишком рано — дадим добежать остальным частям
-            if (!processedMediaGroups.add(mg)) return; // уже делали для этого альбома
+            // processed с TTL, чтобы не хранить бесконечно
+            Long prev = processedMediaGroups.putIfAbsent(mg, System.currentTimeMillis());
+            if (prev != null) return; // уже делали для этого альбома
         }
 
         // ===== команды =====
@@ -195,7 +257,7 @@ public class BotService {
             String confirm = MessageTemplates.confirmSaved(saved, zone);
 
 // В момент создания заказа не пересылаем фото/видео.
-// Медиа уйдут вместе с напоминанием за 72 часа в ReminderScheduler.
+// Медиа уйдут вместе с напоминанием (теперь — в личку всем приватным получателям).
             sendToGroup(chatId, confirm);
             return;
         }
