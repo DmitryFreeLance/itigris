@@ -4,13 +4,16 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalTime;
 import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
-/** Планировщик напоминаний: реальный lead (72ч), рассылка в ЛС всем приватным пользователям. */
+/** Планировщик напоминаний: строго в локальные 09:00 дня (due - leadHours). */
 public class ReminderScheduler {
     private static final Logger log = LoggerFactory.getLogger(ReminderScheduler.class);
 
@@ -19,13 +22,20 @@ public class ReminderScheduler {
     private final BotService bot;
     private final ZoneId zone;
     private final int scanEveryMin;
-    private final int windowMin;     // окно в минутах относительно lead (симметричное)
-    private final double leadHours;  // за сколько часов до due слать напоминание
+    private final int windowMin;           // окно в минутах вокруг целевого времени 09:00
+    private final double leadHours;        // за сколько часов до due слать напоминание (обычно 72)
+    private final int reminderLocalHour;   // локальный час отправки (по умолчанию 9)
 
     private final ScheduledExecutorService ses = Executors.newSingleThreadScheduledExecutor();
 
-    public ReminderScheduler(OrderRepository repo, ItigrisClient itigris, BotService bot, ZoneId zone,
-                             int scanEveryMin, int windowMin, double leadHours) {
+    public ReminderScheduler(OrderRepository repo,
+                             ItigrisClient itigris,
+                             BotService bot,
+                             ZoneId zone,
+                             int scanEveryMin,
+                             int windowMin,
+                             double leadHours,
+                             int reminderLocalHour) {
         this.repo = repo;
         this.itigris = itigris;
         this.bot = bot;
@@ -33,6 +43,7 @@ public class ReminderScheduler {
         this.scanEveryMin = scanEveryMin;
         this.windowMin = windowMin;
         this.leadHours = leadHours;
+        this.reminderLocalHour = reminderLocalHour;
     }
 
     public void start() {
@@ -44,57 +55,58 @@ public class ReminderScheduler {
         try {
             Instant now = Instant.now();
 
-            long leadMillis   = (long) (leadHours * 3_600_000L);     // 72 часа
-            long windowMillis = windowMin * 60_000L;                 // ± окно
+            long windowSec = windowMin * 60L;
+            long remindFromSec = now.minusSeconds(windowSec).getEpochSecond();
+            long remindToSec   = now.plusSeconds(windowSec).getEpochSecond();
 
-            long leadFromMs = now.toEpochMilli() + (leadMillis - windowMillis);
-            long leadToMs   = now.toEpochMilli() + (leadMillis + windowMillis);
+            // Сдвиг в секундах для lead (например, 72 часа)
+            long leadSec = (long) (leadHours * 3600L);
 
-            long leadFromSec = Math.min(leadFromMs, leadToMs) / 1000;
-            long leadToSec   = Math.max(leadFromMs, leadToMs) / 1000;
+            // Грубый диапазон due для первичного поиска кандидатов: берём ±1 день от целевого remind-времени,
+            // преобразованного обратно в due (remind ~ now ⇒ due ~ now + lead).
+            long dueFromSec = remindFromSec + leadSec - 24 * 3600L;
+            long dueToSec   = remindToSec   + leadSec + 24 * 3600L;
 
-            // Ищем только по due_at (боевой сценарий)
-            List<Order> toRemind = repo.findDueBetween(leadFromSec, leadToSec);
+            // Ищем только те заказы, по которым ещё не отправляли напоминание и due попадает в грубый диапазон
+            List<Order> candidates = repo.findDueBetween(dueFromSec, dueToSec);
 
-            if (!toRemind.isEmpty()) {
-                log.info("Will remind {} orders (lead={}h, window=±{}m, range=[{}..{}])",
-                        toRemind.size(), (long) leadHours, windowMin, leadFromSec, leadToSec);
+            int sent = 0;
+            for (Order o : candidates) {
+                long remindAt = computeRemindAt(o.dueAtEpochSec());
+                // Шлём только если «сейчас» попадает в окно вокруг точного remindAt
+                if (remindAt >= remindFromSec && remindAt <= remindToSec) {
+                    String status = itigris.fetchStatusByOrderId(o.orderNumber());
+                    repo.updateStatus(o.id(), status);
+
+                    String caption = MessageTemplates.reminder(o, status, zone);
+                    bot.sendReminderWithMedia(o, caption);
+
+                    repo.markReminderSent(o.id());
+                    sent++;
+                }
             }
 
-            // Получаем список всех приватных получателей единожды на тик
-            List<Long> recipients = repo.findAllPrivateUserChatIds();
-
-            for (Order o : toRemind) {
-                String status = itigris.fetchStatusByOrderId(o.orderNumber());
-                repo.updateStatus(o.id(), status);
-
-                String caption = MessageTemplates.reminder(o, status, zone);
-
-                int ok = 0;
-                for (Long uid : recipients) {
-                    try {
-                        bot.sendReminderWithMediaToChat(uid, o, caption);
-                        ok++;
-                        // лёгкий троттлинг, чтобы не упереться в лимиты Telegram (≈25/сек)
-                        try {
-                            Thread.sleep(40);
-                        } catch (InterruptedException ie) {
-                            Thread.currentThread().interrupt();
-                        }
-                    } catch (Exception sendErr) {
-                        log.warn("Failed to send reminder to user chat {} for order {}: {}",
-                                uid, o.orderNumber(), sendErr.toString());
-                    }
-                }
-
-                if (ok > 0) {
-                    repo.markReminderSent(o.id());
-                } else {
-                    log.warn("Reminder NOT marked sent for order {}: no successful deliveries", o.orderNumber());
-                }
+            if (sent > 0) {
+                log.info(
+                        "Sent {} reminders at ~{}:00 local (zone={}, lead={}h, window=±{}m, scanEvery={}m)",
+                        sent, reminderLocalHour, zone, (long) leadHours, windowMin, scanEveryMin
+                );
             }
         } catch (Exception e) {
             log.error("Scheduler tick error", e);
         }
+    }
+
+    /** Вычисляет точный момент напоминания: локальные HH:00 (обычно 09:00) в дату (due - leadHours). */
+    private long computeRemindAt(long dueAtEpochSec) {
+        // due в локальной зоне
+        ZonedDateTime due = Instant.ofEpochSecond(dueAtEpochSec).atZone(zone);
+        // момент (due - lead)
+        ZonedDateTime leadMoment = due.minusSeconds((long) (leadHours * 3600L));
+        // локальная дата напоминания
+        LocalDate remindDate = leadMoment.toLocalDate();
+        // фиксированное локальное время HH:00
+        ZonedDateTime remindZdt = remindDate.atTime(LocalTime.of(reminderLocalHour, 0)).atZone(zone);
+        return remindZdt.toEpochSecond();
     }
 }

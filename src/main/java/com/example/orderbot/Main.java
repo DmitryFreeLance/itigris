@@ -24,6 +24,7 @@ public class Main {
         final int    SCAN_INTERVAL_MIN   = intEnv("SCAN_INTERVAL_MINUTES", 15);
         final int    REMINDER_WINDOW_MIN = intEnv("REMINDER_WINDOW_MINUTES", 60);
         final double REMINDER_LEAD_HOURS = doubleEnv("REMINDER_LEAD_HOURS", 72.0);
+        final int    REMINDER_LOCAL_HOUR = intEnv("REMINDER_LOCAL_HOUR", 9); // новый параметр: 09:00 по умолчанию
 
         // ====== ИНИЦ СИСТЕМЫ ======
         ZoneId zoneId = ZoneId.of(TZ);
@@ -48,12 +49,18 @@ public class Main {
         ReminderScheduler scheduler = new ReminderScheduler(
                 repo, itigris, bot, zoneId,
                 SCAN_INTERVAL_MIN, REMINDER_WINDOW_MIN,
-                REMINDER_LEAD_HOURS
+                REMINDER_LEAD_HOURS,
+                REMINDER_LOCAL_HOUR
         );
         scheduler.start();
 
-        log.info("Bot started (Docker/ENV). TZ={}, DB={}, scanEvery={}m, window=±{}m, leadHours={}",
-                TZ, DB_PATH, SCAN_INTERVAL_MIN, REMINDER_WINDOW_MIN, REMINDER_LEAD_HOURS);
+        log.info(
+                "Bot started (Docker/ENV). TZ={}, DB={}, scanEvery={}m, window=±{}m, leadHours={}, remindAt={} (local hour)",
+                TZ, DB_PATH, SCAN_INTERVAL_MIN, REMINDER_WINDOW_MIN, REMINDER_LEAD_HOURS, REMINDER_LOCAL_HOUR
+        );
+
+        // (опционально) graceful shutdown — если нужно корректно остановить планировщик при SIGTERM,
+        // можно повесить shutdown hook и вызвать scheduler.stop(), если добавите такой метод.
     }
 
     // ===== helpers for env =====
