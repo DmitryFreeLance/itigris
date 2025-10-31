@@ -22,9 +22,12 @@ public class Main {
         final String TZ                  = envOrDefault("TZ", "Asia/Yekaterinburg"); // Уфа
 
         final int    SCAN_INTERVAL_MIN   = intEnv("SCAN_INTERVAL_MINUTES", 15);
-        final int    REMINDER_WINDOW_MIN = intEnv("REMINDER_WINDOW_MINUTES", 60);
+        final int    REMINDER_WINDOW_MIN = intEnv("REMINDER_WINDOW_MINUTES", 60); // мягкое окно для тиков (не жёсткое)
         final double REMINDER_LEAD_HOURS = doubleEnv("REMINDER_LEAD_HOURS", 72.0);
-        final int    REMINDER_LOCAL_HOUR = intEnv("REMINDER_LOCAL_HOUR", 9); // новый параметр: 09:00 по умолчанию
+
+        // Новые параметры: "жёсткое" окно 08:00–10:00 локально для даты (due - lead)
+        final int    REMIND_WINDOW_START_HOUR = intEnv("REMIND_WINDOW_START_HOUR", 8);
+        final int    REMIND_WINDOW_END_HOUR   = intEnv("REMIND_WINDOW_END_HOUR", 10);
 
         // ====== ИНИЦ СИСТЕМЫ ======
         ZoneId zoneId = ZoneId.of(TZ);
@@ -50,17 +53,16 @@ public class Main {
                 repo, itigris, bot, zoneId,
                 SCAN_INTERVAL_MIN, REMINDER_WINDOW_MIN,
                 REMINDER_LEAD_HOURS,
-                REMINDER_LOCAL_HOUR
+                REMIND_WINDOW_START_HOUR,
+                REMIND_WINDOW_END_HOUR
         );
         scheduler.start();
 
         log.info(
-                "Bot started (Docker/ENV). TZ={}, DB={}, scanEvery={}m, window=±{}m, leadHours={}, remindAt={} (local hour)",
-                TZ, DB_PATH, SCAN_INTERVAL_MIN, REMINDER_WINDOW_MIN, REMINDER_LEAD_HOURS, REMINDER_LOCAL_HOUR
+                "Bot started. TZ={}, DB={}, scanEvery={}m, softWindow=±{}m, leadHours={}, hardWindow={}–{} local",
+                TZ, DB_PATH, SCAN_INTERVAL_MIN, REMINDER_WINDOW_MIN, REMINDER_LEAD_HOURS,
+                REMIND_WINDOW_START_HOUR, REMIND_WINDOW_END_HOUR
         );
-
-        // (опционально) graceful shutdown — если нужно корректно остановить планировщик при SIGTERM,
-        // можно повесить shutdown hook и вызвать scheduler.stop(), если добавите такой метод.
     }
 
     // ===== helpers for env =====
