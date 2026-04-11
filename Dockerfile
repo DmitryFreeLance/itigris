@@ -21,7 +21,7 @@ RUN set -eux; \
 
 
 # === Stage 2: runtime ===
-FROM openjdk:21-jdk-slim
+FROM eclipse-temurin:21-jre-jammy
 WORKDIR /opt/order-bot
 
 # (опционально) корректные TZ в образе
