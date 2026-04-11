@@ -29,6 +29,9 @@ public class Main {
         final int    REMIND_WINDOW_START_HOUR = intEnv("REMIND_WINDOW_START_HOUR", 8);
         final int    REMIND_WINDOW_END_HOUR   = intEnv("REMIND_WINDOW_END_HOUR", 10);
 
+        log.info("Startup config: tokenPrefix='{}', itigrisClient='{}', db='{}', tz='{}'",
+                maskToken(BOT_TOKEN), ITIGRIS_CLIENT, DB_PATH, TZ);
+
         // ====== ИНИЦ СИСТЕМЫ ======
         ZoneId zoneId = ZoneId.of(TZ);
 
@@ -89,5 +92,11 @@ public class Main {
         String v = System.getenv(key);
         if (v == null || v.isBlank()) return def;
         try { return Double.parseDouble(v.trim().replace(',', '.')); } catch (Exception e) { return def; }
+    }
+
+    private static String maskToken(String token) {
+        if (token == null || token.isBlank()) return "<empty>";
+        int n = Math.min(6, token.length());
+        return token.substring(0, n) + "***";
     }
 }

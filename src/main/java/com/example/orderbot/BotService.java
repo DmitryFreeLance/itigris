@@ -58,7 +58,7 @@ public class BotService {
 
     public void start() {
         pollingExecutor.submit(this::pollingLoop);
-        log.info("MAX bot polling started");
+        log.info("MAX bot polling started (apiBase={}, updatesType=message_created)", MAX_API_BASE);
     }
 
     public void sendToGroup(long chatId, String text) {
@@ -74,6 +74,7 @@ public class BotService {
     public void sendReminderWithMedia(Order o, String captionHtml) {
         List<MediaItem> media = parseMediaJson(o.mediaJson());
         long chatId = o.groupChatId();
+        log.info("Preparing reminder send: order={}, chatId={}, mediaItems={}", o.orderNumber(), chatId, media.size());
 
         if (media.isEmpty()) {
             if (o.photoFileId() != null) sendPhotoToGroup(chatId, o.photoFileId(), captionHtml);
@@ -101,11 +102,15 @@ public class BotService {
     private void pollingLoop() {
         while (running) {
             try {
+                Long markerBefore = marker;
                 JsonNode root = getUpdates(100, 30, marker);
                 JsonNode updates = root.path("updates");
                 if (root.hasNonNull("marker")) {
                     marker = root.get("marker").asLong();
                 }
+                int updatesCount = updates.isArray() ? updates.size() : 0;
+                log.info("MAX poll result: updates={}, markerBefore={}, markerAfter={}",
+                        updatesCount, markerBefore, marker);
                 if (updates.isArray()) {
                     for (JsonNode u : updates) {
                         handle(u);
@@ -163,6 +168,10 @@ public class BotService {
             int code = res.statusCode();
             if (code < 200 || code >= 300) {
                 log.warn("MAX sendMessage failed: chatId={}, code={}, body={}", chatId, code, res.body());
+            } else {
+                int attachmentsCount = attachments == null ? 0 : attachments.size();
+                log.info("MAX message sent: chatId={}, code={}, textLen={}, attachments={}",
+                        chatId, code, text == null ? 0 : text.length(), attachmentsCount);
             }
         } catch (Exception e) {
             log.warn("MAX sendMessage error: {}", e.toString());
@@ -229,6 +238,9 @@ public class BotService {
         }
 
         String body = message.path("body").path("text").asText("");
+        int attCount = message.path("body").path("attachments").isArray() ? message.path("body").path("attachments").size() : 0;
+        log.info("Incoming message: chatId={}, mid={}, text='{}', attachments={}",
+                chatId, mid, shortText(body), attCount);
 
         if (startsWith(body, "/status")) {
             String[] parts = body.trim().split("\\s+", 2);
@@ -237,6 +249,7 @@ public class BotService {
                 return;
             }
             String number = parts[1].trim();
+            log.info("Status command received: chatId={}, order={}", chatId, number);
             String s = itigris.fetchStatusByOrderId(number);
             sendToGroup(chatId, "Статус заказа " + number + ": " + s);
             return;
@@ -253,13 +266,17 @@ public class BotService {
             String dep = parts[3].trim();
 
             long due = DateUtil.parseToEpochSec(dateStr, zone);
+            log.info("Order command parsed: chatId={}, order={}, dueInput='{}', department='{}'",
+                    chatId, number, dateStr, dep);
 
             List<MediaItem> media = extractMediaFromMessage(message);
             String mediaJson = toMediaJson(media);
+            log.info("Order media extracted: chatId={}, order={}, mediaItems={}", chatId, number, media.size());
 
             String photoId = bestSingleImageToken(message);
             Order o = Order.ofNew(number, dep, due, chatId, photoId, null, mediaJson);
             long id = repo.insert(o);
+            log.info("Order saved: id={}, chatId={}, order={}, dueEpoch={}", id, chatId, number, due);
 
             Order saved = new Order(id, o.orderNumber(), o.department(), o.dueAtEpochSec(), o.groupChatId(),
                     o.photoFileId(), o.reminder72hSent(), o.lastKnownStatus(), o.lastStatusCheckEpochSec(),
@@ -275,12 +292,16 @@ public class BotService {
 
             if (number != null && dateStr != null && dep != null) {
                 long due = DateUtil.parseToEpochSec(dateStr, zone);
+                log.info("Card auto-parse success: chatId={}, order={}, dueInput='{}', department='{}'",
+                        chatId, number, dateStr, dep);
                 List<MediaItem> media = extractMediaFromMessage(message);
                 String mediaJson = toMediaJson(media);
                 String photoId = bestSingleImageToken(message);
 
                 Order o = Order.ofNew(number.trim(), dep.trim(), due, chatId, photoId, null, mediaJson);
                 long id = repo.insert(o);
+                log.info("Order saved from card: id={}, chatId={}, order={}, dueEpoch={}, mediaItems={}",
+                        id, chatId, number.trim(), due, media.size());
 
                 Order saved = new Order(id, o.orderNumber(), o.department(), o.dueAtEpochSec(), o.groupChatId(),
                         o.photoFileId(), o.reminder72hSent(), o.lastKnownStatus(), o.lastStatusCheckEpochSec(),
@@ -349,6 +370,13 @@ public class BotService {
     private static String firstNonBlank(String a, String b) {
         if (a != null && !a.isBlank()) return a;
         return b;
+    }
+
+    private static String shortText(String s) {
+        if (s == null) return "";
+        String normalized = s.replaceAll("\\s+", " ").trim();
+        if (normalized.length() <= 120) return normalized;
+        return normalized.substring(0, 117) + "...";
     }
 
     // Обратная совместимость: у старых записей может быть только fileId.

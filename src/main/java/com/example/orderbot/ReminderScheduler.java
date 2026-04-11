@@ -51,12 +51,15 @@ public class ReminderScheduler {
 
     public void start() {
         ses.scheduleAtFixedRate(this::tick, 0, scanEveryMin, TimeUnit.MINUTES);
+        log.info("Reminder scheduler started: scanEvery={}m, softWindow=±{}m, leadHours={}, hardWindow={}–{} (zone={})",
+                scanEveryMin, windowMin, leadHours, windowStartHourLocal, windowEndHourLocal, zone);
     }
 
     private void tick() {
         try {
             Instant now = Instant.now();
             long nowSec = now.getEpochSecond();
+            log.info("Scheduler tick started: nowEpoch={}, nowLocal={}", nowSec, now.atZone(zone));
 
             // Небольшая "мягкость" вокруг тиков: если тик раз в N минут, добавим ±windowMin, чтобы не промахнуться,
             // но финальный жёсткий фильтр — только внутри 08:00–10:00 локально.
@@ -70,6 +73,8 @@ public class ReminderScheduler {
             long dueToSec   = softToSec   + leadSec + 24 * 3600L;
 
             List<Order> candidates = repo.findDueBetween(dueFromSec, dueToSec);
+            log.info("Scheduler scan: candidates={}, dueRange=[{}, {}], leadHours={}",
+                    candidates.size(), dueFromSec, dueToSec, leadHours);
 
             int sent = 0;
             for (Order o : candidates) {
@@ -78,6 +83,8 @@ public class ReminderScheduler {
                 boolean inHardWindow = (nowSec >= w.startEpoch) && (nowSec <= w.endEpoch);
 
                 if (inHardWindow) {
+                    log.info("Reminder due now: orderId={}, order={}, chatId={}, dueAt={}, remindWindow=[{}, {}]",
+                            o.id(), o.orderNumber(), o.groupChatId(), o.dueAtEpochSec(), w.startEpoch, w.endEpoch);
                     String status = itigris.fetchStatusByOrderId(o.orderNumber());
                     repo.updateStatus(o.id(), status);
 
@@ -85,14 +92,15 @@ public class ReminderScheduler {
                     bot.sendReminderWithMedia(o, caption);
 
                     repo.markReminderSent(o.id());
+                    log.info("Reminder sent: orderId={}, order={}, chatId={}", o.id(), o.orderNumber(), o.groupChatId());
                     sent++;
+                } else {
+                    log.info("Reminder skipped (outside hard window): orderId={}, order={}, chatId={}, remindWindow=[{}, {}], now={}",
+                            o.id(), o.orderNumber(), o.groupChatId(), w.startEpoch, w.endEpoch, nowSec);
                 }
             }
 
-            if (sent > 0) {
-                log.info("Sent {} reminders in hard window {}:00–{}:00 (zone={}, lead={}h, scanEvery={}m)",
-                        sent, windowStartHourLocal, windowEndHourLocal, zone, (long) leadHours, scanEveryMin);
-            }
+            log.info("Scheduler tick finished: sent={}, candidates={}", sent, candidates.size());
         } catch (Exception e) {
             log.error("Scheduler tick error", e);
         }
