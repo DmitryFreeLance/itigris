@@ -1,81 +1,74 @@
 package com.example.orderbot;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.pengrad.telegrambot.TelegramBot;
-import com.pengrad.telegrambot.UpdatesListener;
-import com.pengrad.telegrambot.model.*;
-import com.pengrad.telegrambot.model.request.InputMedia;
-import com.pengrad.telegrambot.model.request.InputMediaPhoto;
-import com.pengrad.telegrambot.model.request.InputMediaVideo;
-import com.pengrad.telegrambot.model.request.ParseMode;
-import com.pengrad.telegrambot.request.SendMediaGroup;
-import com.pengrad.telegrambot.request.SendMessage;
-import com.pengrad.telegrambot.request.SendPhoto;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.URI;
+import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.ZoneId;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/** Дедупликация: по update_id и по media_group_id (с таймаутом ~1.2с для набора альбома). */
+/**
+ * Реализация бота для MAX (long polling через GET /updates и отправка через POST /messages).
+ */
 public class BotService {
     private static final Logger log = LoggerFactory.getLogger(BotService.class);
 
-    private final TelegramBot bot;
+    private static final String MAX_API_BASE = "https://platform-api.max.ru";
+
+    private final String token;
     private final OrderRepository repo;
     private final ZoneId zone;
     private final ItigrisClient itigris;
+
+    private final HttpClient http = HttpClient.newHttpClient();
+    private final ObjectMapper mapper = new ObjectMapper();
+    private final ExecutorService pollingExecutor = Executors.newSingleThreadExecutor();
+
+    private volatile boolean running = true;
+    private volatile Long marker = null;
+
+    private final Set<String> seenMessageIds = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
     private static final Pattern P_ORDER_NUM = Pattern.compile("(?i)номер\\s+заказа\\s*[:#-]?\\s*([\\w-]+)");
     private static final Pattern P_DATE = Pattern.compile("(?i)(дата\\s+завершения\\s+заказа|срок\\s+готовности|дата)\\s*[:\\-]?\\s*([0-9.:\\-\\s]+)");
     private static final Pattern P_DEP = Pattern.compile("(?i)департамент\\s*[:\\-]?\\s*([^\\n]+)");
 
-    private final ObjectMapper mapper = new ObjectMapper();
-
-    // агрегация альбомов и дедуп по группам
-    private final Map<String, AlbumBucket> albumBuckets = new ConcurrentHashMap<>();
-    private final Set<String> processedMediaGroups = Collections.newSetFromMap(new ConcurrentHashMap<>());
-    // дедуп по update_id
-    private final Set<Integer> seenUpdateIds = Collections.newSetFromMap(new ConcurrentHashMap<>());
-
     public BotService(String token, OrderRepository repo, ZoneId zone, ItigrisClient itigris) {
-        this.bot = new TelegramBot(token);
+        this.token = token;
         this.repo = repo;
         this.zone = zone;
         this.itigris = itigris;
     }
 
     public void start() {
-        bot.setUpdatesListener(updates -> {
-            try {
-                long now = System.currentTimeMillis();
-                // очистка старых бакетов альбомов (>= 2 минуты)
-                albumBuckets.entrySet().removeIf(e -> now - e.getValue().createdAtMs > 120_000);
-                // контроль разрастания seenUpdateIds
-                if (seenUpdateIds.size() > 5000) {
-                    seenUpdateIds.clear();
-                }
-
-                for (Update u : updates) handle(u);
-                return UpdatesListener.CONFIRMED_UPDATES_ALL;
-            } catch (Exception e) {
-                log.error("update handling error", e);
-                return UpdatesListener.CONFIRMED_UPDATES_ALL;
-            }
-        });
+        pollingExecutor.submit(this::pollingLoop);
+        log.info("MAX bot polling started");
     }
 
     public void sendToGroup(long chatId, String text) {
-        SendMessage sm = new SendMessage(chatId, text).parseMode(ParseMode.HTML);
-        bot.execute(sm);
+        sendMessage(chatId, text, null);
     }
-    public void sendPhotoToGroup(long chatId, String fileId, String captionHtml) {
-        SendPhoto sp = new SendPhoto(chatId, fileId).caption(captionHtml).parseMode(ParseMode.HTML);
-        bot.execute(sp);
+
+    public void sendPhotoToGroup(long chatId, String fileIdOrToken, String captionHtml) {
+        List<Object> attachments = new ArrayList<>();
+        attachments.add(imageAttachment(fileIdOrToken, null));
+        sendMessage(chatId, captionHtml, attachments);
     }
 
     public void sendReminderWithMedia(Order o, String captionHtml) {
@@ -87,31 +80,119 @@ public class BotService {
             else sendToGroup(chatId, captionHtml);
             return;
         }
-        if (media.size() == 1) {
-            MediaItem it = media.get(0);
-            if ("video".equals(it.type)) {
-                SendMediaGroup group = new SendMediaGroup(chatId,
-                        new InputMediaVideo(it.fileId).caption(captionHtml).parseMode(ParseMode.HTML));
-                bot.execute(group);
-            } else {
-                sendPhotoToGroup(chatId, it.fileId, captionHtml);
-            }
-            return;
-        }
-        List<InputMedia> ims = new ArrayList<>();
-        for (int i = 0; i < media.size(); i++) {
-            MediaItem it = media.get(i);
-            if ("video".equals(it.type)) {
-                InputMediaVideo im = new InputMediaVideo(it.fileId);
-                if (i == 0) im.caption(captionHtml).parseMode(ParseMode.HTML);
-                ims.add(im);
-            } else {
-                InputMediaPhoto im = new InputMediaPhoto(it.fileId);
-                if (i == 0) im.caption(captionHtml).parseMode(ParseMode.HTML);
-                ims.add(im);
+
+        List<Object> attachments = new ArrayList<>();
+        for (MediaItem m : media) {
+            if (m == null || m.type == null) continue;
+            if ("video".equals(m.type)) {
+                attachments.add(videoAttachment(firstNonBlank(m.token, m.fileId), m.url));
+            } else if ("photo".equals(m.type) || "image".equals(m.type)) {
+                attachments.add(imageAttachment(firstNonBlank(m.token, m.fileId), m.url));
             }
         }
-        bot.execute(new SendMediaGroup(chatId, ims.toArray(new InputMedia[0])));
+
+        if (attachments.isEmpty()) {
+            sendToGroup(chatId, captionHtml);
+        } else {
+            sendMessage(chatId, captionHtml, attachments);
+        }
+    }
+
+    private void pollingLoop() {
+        while (running) {
+            try {
+                JsonNode root = getUpdates(100, 30, marker);
+                JsonNode updates = root.path("updates");
+                if (root.hasNonNull("marker")) {
+                    marker = root.get("marker").asLong();
+                }
+                if (updates.isArray()) {
+                    for (JsonNode u : updates) {
+                        handle(u);
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("MAX polling error: {}", e.toString());
+                sleepQuietly(5000L);
+            }
+        }
+    }
+
+    private JsonNode getUpdates(int limit, int timeoutSec, Long marker) throws Exception {
+        StringBuilder url = new StringBuilder(MAX_API_BASE)
+                .append("/updates?limit=").append(limit)
+                .append("&timeout=").append(timeoutSec)
+                .append("&types=").append(encode("message_created"));
+        if (marker != null) {
+            url.append("&marker=").append(marker);
+        }
+
+        HttpRequest req = HttpRequest.newBuilder(URI.create(url.toString()))
+                .GET()
+                .header("Authorization", token)
+                .header("Accept", "application/json")
+                .build();
+
+        HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
+        int code = res.statusCode();
+        if (code >= 200 && code < 300) {
+            return mapper.readTree(res.body());
+        }
+        throw new IllegalStateException("MAX /updates failed: HTTP " + code + ", body=" + res.body());
+    }
+
+    private void sendMessage(long chatId, String text, List<Object> attachments) {
+        try {
+            String url = MAX_API_BASE + "/messages?chat_id=" + chatId;
+
+            var body = mapper.createObjectNode();
+            body.put("text", text);
+            body.put("format", "html");
+            body.put("notify", true);
+            if (attachments != null && !attachments.isEmpty()) {
+                body.set("attachments", mapper.valueToTree(attachments));
+            }
+
+            HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+                    .header("Authorization", token)
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
+                    .build();
+
+            HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
+            int code = res.statusCode();
+            if (code < 200 || code >= 300) {
+                log.warn("MAX sendMessage failed: chatId={}, code={}, body={}", chatId, code, res.body());
+            }
+        } catch (Exception e) {
+            log.warn("MAX sendMessage error: {}", e.toString());
+        }
+    }
+
+    private Object imageAttachment(String tokenOrFileId, String url) {
+        var item = mapper.createObjectNode();
+        item.put("type", "image");
+        var payload = mapper.createObjectNode();
+        if (tokenOrFileId != null && !tokenOrFileId.isBlank()) {
+            payload.put("token", tokenOrFileId);
+        } else if (url != null && !url.isBlank()) {
+            payload.put("url", url);
+        }
+        item.set("payload", payload);
+        return item;
+    }
+
+    private Object videoAttachment(String tokenOrFileId, String url) {
+        var item = mapper.createObjectNode();
+        item.put("type", "video");
+        var payload = mapper.createObjectNode();
+        if (tokenOrFileId != null && !tokenOrFileId.isBlank()) {
+            payload.put("token", tokenOrFileId);
+        } else if (url != null && !url.isBlank()) {
+            payload.put("url", url);
+        }
+        item.set("payload", payload);
+        return item;
     }
 
     private List<MediaItem> parseMediaJson(String json) {
@@ -123,56 +204,48 @@ public class BotService {
             return List.of();
         }
     }
+
     private String toMediaJson(List<MediaItem> items) {
-        try { return mapper.writeValueAsString(items); }
-        catch (Exception e) { return "[]"; }
+        try {
+            return mapper.writeValueAsString(items);
+        } catch (Exception e) {
+            return "[]";
+        }
     }
 
-    private void handle(Update u) throws Exception {
-        // ----- антидубль по update_id -----
-        Integer uid = u.updateId();
-        if (uid != null && !seenUpdateIds.add(uid)) {
-            return; // уже обрабатывали
+    private void handle(JsonNode update) throws Exception {
+        String updateType = update.path("update_type").asText("");
+        if (!"message_created".equals(updateType)) return;
+
+        JsonNode message = update.path("message");
+        JsonNode recipient = message.path("recipient");
+        if (!recipient.hasNonNull("chat_id")) return;
+        long chatId = recipient.get("chat_id").asLong();
+
+        String mid = message.path("body").path("mid").asText(null);
+        if (mid != null && !mid.isBlank()) {
+            if (!seenMessageIds.add(mid)) return;
+            if (seenMessageIds.size() > 5000) seenMessageIds.clear();
         }
 
-        Message m = u.message();
-        if (m == null || m.chat() == null || m.chat().id() == null) return;
-        long chatId = m.chat().id();
+        String body = message.path("body").path("text").asText("");
 
-        // агрегация альбома
-        collectAlbumPiece(m);
-
-        String body = m.caption() != null ? m.caption() : (m.text() != null ? m.text() : "");
-
-        // Если это альбом и есть команда — ждём ~1.2с, чтобы успели прийти все части, и обрабатываем ОДИН раз
-        String mg = m.mediaGroupId();
-        boolean isAlbum = (mg != null);
-        if (isAlbum && (startsWith(body, "/orderin") || startsWith(body, "/order") || startsWith(body, "/status"))) {
-            AlbumBucket b = albumBuckets.get(mg);
-            if (b == null) return; // ждём
-            long age = System.currentTimeMillis() - b.createdAtMs;
-            if (age < 1200L) return; // слишком рано — дадим добежать остальным частям
-            if (!processedMediaGroups.add(mg)) return; // уже делали для этого альбома
-        }
-
-        // ===== команды =====
         if (startsWith(body, "/status")) {
             String[] parts = body.trim().split("\\s+", 2);
             if (parts.length < 2) {
-                bot.execute(new SendMessage(chatId, "Формат: /status <номер заказа>"));
+                sendToGroup(chatId, "Формат: /status <номер заказа>");
                 return;
             }
             String number = parts[1].trim();
             String s = itigris.fetchStatusByOrderId(number);
-            bot.execute(new SendMessage(chatId, "Статус заказа " + number + ": " + s));
+            sendToGroup(chatId, "Статус заказа " + number + ": " + s);
             return;
         }
 
-        // /orderin <номер> <дата> <департамент> — синоним /order
         if (startsWith(body, "/orderin") || startsWith(body, "/order")) {
             String[] parts = body.trim().split("\\s+", 4);
             if (parts.length < 4) {
-                bot.execute(new SendMessage(chatId, "Формат: /order(ин) <номер> <дата(21.10.2025)> <департамент>"));
+                sendToGroup(chatId, "Формат: /order(ин) <номер> <дата(21.10.2025)> <департамент>");
                 return;
             }
             String number = parts[1].trim();
@@ -181,35 +254,30 @@ public class BotService {
 
             long due = DateUtil.parseToEpochSec(dateStr, zone);
 
-            List<MediaItem> media = extractMediaFromMessageOrAlbum(m);
+            List<MediaItem> media = extractMediaFromMessage(message);
             String mediaJson = toMediaJson(media);
 
-            String photoId = bestSinglePhotoId(m);
+            String photoId = bestSingleImageToken(message);
             Order o = Order.ofNew(number, dep, due, chatId, photoId, null, mediaJson);
-            long id = repo.insert(o); // из-за UNIQUE вставка второй раз просто вернёт уже существующий id
+            long id = repo.insert(o);
 
-            // подтверждение — только текст, без пересылки медиа
             Order saved = new Order(id, o.orderNumber(), o.department(), o.dueAtEpochSec(), o.groupChatId(),
                     o.photoFileId(), o.reminder72hSent(), o.lastKnownStatus(), o.lastStatusCheckEpochSec(),
                     o.createdAtEpochSec(), o.triggerAtEpochSec(), o.mediaJson());
-            String confirm = MessageTemplates.confirmSaved(saved, zone);
-
-// В момент создания заказа не пересылаем фото/видео.
-// Медиа уйдут вместе с напоминанием за 72 часа в ReminderScheduler.
-            sendToGroup(chatId, confirm);
+            sendToGroup(chatId, MessageTemplates.confirmSaved(saved, zone));
             return;
         }
 
-        // Авторазбор карточки (без команды)
         if (!body.isBlank()) {
             String number = find(P_ORDER_NUM, body);
             String dateStr = find(P_DATE, body, 2);
             String dep = find(P_DEP, body);
+
             if (number != null && dateStr != null && dep != null) {
                 long due = DateUtil.parseToEpochSec(dateStr, zone);
-                List<MediaItem> media = extractMediaFromMessageOrAlbum(m);
+                List<MediaItem> media = extractMediaFromMessage(message);
                 String mediaJson = toMediaJson(media);
-                String photoId = bestSinglePhotoId(m);
+                String photoId = bestSingleImageToken(message);
 
                 Order o = Order.ofNew(number.trim(), dep.trim(), due, chatId, photoId, null, mediaJson);
                 long id = repo.insert(o);
@@ -217,56 +285,37 @@ public class BotService {
                 Order saved = new Order(id, o.orderNumber(), o.department(), o.dueAtEpochSec(), o.groupChatId(),
                         o.photoFileId(), o.reminder72hSent(), o.lastKnownStatus(), o.lastStatusCheckEpochSec(),
                         o.createdAtEpochSec(), o.triggerAtEpochSec(), o.mediaJson());
-                String confirm = MessageTemplates.confirmSaved(saved, zone);
-
-// Подтверждение без медиа — фото/альбом отправятся только в напоминании.
-                sendToGroup(chatId, confirm);
+                sendToGroup(chatId, MessageTemplates.confirmSaved(saved, zone));
             }
         }
     }
 
-    // ===== альбомы и медиа =====
-    private void collectAlbumPiece(Message m) {
-        String mg = m.mediaGroupId();
-        if (mg == null) return;
-        AlbumBucket bucket = albumBuckets.computeIfAbsent(mg, k -> new AlbumBucket());
-        bucket.createdAtMs = System.currentTimeMillis();
-        if (m.photo() != null && m.photo().length > 0) bucket.items.add(new MediaItem("photo", bestPhotoId(m.photo())));
-        if (m.video() != null) bucket.items.add(new MediaItem("video", m.video().fileId()));
-        if (m.document() != null && m.document().mimeType() != null) {
-            String mt = m.document().mimeType();
-            if (mt.startsWith("image/")) bucket.items.add(new MediaItem("photo", m.document().fileId()));
-            else if (mt.startsWith("video/")) bucket.items.add(new MediaItem("video", m.document().fileId()));
-        }
-    }
-    private List<MediaItem> extractMediaFromMessageOrAlbum(Message m) {
-        String mg = m.mediaGroupId();
-        if (mg != null) {
-            AlbumBucket b = albumBuckets.get(mg);
-            if (b != null && !b.items.isEmpty()) return new ArrayList<>(b.items);
-        }
+    private List<MediaItem> extractMediaFromMessage(JsonNode message) {
         List<MediaItem> list = new ArrayList<>();
-        if (m.photo() != null && m.photo().length > 0) list.add(new MediaItem("photo", bestPhotoId(m.photo())));
-        if (m.video() != null) list.add(new MediaItem("video", m.video().fileId()));
-        if (m.document() != null && m.document().mimeType() != null) {
-            String mt = m.document().mimeType();
-            if (mt.startsWith("image/")) list.add(new MediaItem("photo", m.document().fileId()));
-            else if (mt.startsWith("video/")) list.add(new MediaItem("video", m.document().fileId()));
+        JsonNode attachments = message.path("body").path("attachments");
+        if (!attachments.isArray()) return list;
+
+        for (JsonNode a : attachments) {
+            String type = a.path("type").asText("");
+            JsonNode payload = a.path("payload");
+            String token = payload.path("token").asText(null);
+            String url = payload.path("url").asText(null);
+
+            if ("image".equals(type)) {
+                list.add(new MediaItem("photo", null, token, url));
+            } else if ("video".equals(type)) {
+                list.add(new MediaItem("video", null, token, url));
+            }
         }
         return list;
     }
 
-    private String bestSinglePhotoId(Message m) {
-        if (m.photo() == null || m.photo().length == 0) return null;
-        return bestPhotoId(m.photo());
-    }
-    private String bestPhotoId(PhotoSize[] ph) {
-        PhotoSize best = ph[0];
-        for (PhotoSize p : ph) {
-            Long size = p.fileSize();
-            if (size != null && (best.fileSize() == null || size > best.fileSize())) best = p;
+    private String bestSingleImageToken(JsonNode message) {
+        List<MediaItem> media = extractMediaFromMessage(message);
+        for (MediaItem m : media) {
+            if ("photo".equals(m.type)) return firstNonBlank(m.token, m.fileId);
         }
-        return best.fileId();
+        return null;
     }
 
     private boolean startsWith(String body, String cmd) {
@@ -274,17 +323,49 @@ public class BotService {
         String t = body.trim();
         return t.equalsIgnoreCase(cmd) || t.toLowerCase().startsWith((cmd + " ").toLowerCase());
     }
-    private String find(Pattern p, String text) { Matcher m = p.matcher(text); return m.find() ? m.group(1) : null; }
-    private String find(Pattern p, String text, int groupIdx) { Matcher m = p.matcher(text); return m.find() ? m.group(groupIdx) : null; }
 
-    // ===== служебные типы =====
-    public static class MediaItem {
-        public String type; public String fileId;
-        public MediaItem() {}
-        public MediaItem(String type, String fileId) { this.type = type; this.fileId = fileId; }
+    private String find(Pattern p, String text) {
+        Matcher m = p.matcher(text);
+        return m.find() ? m.group(1) : null;
     }
-    private static class AlbumBucket {
-        long createdAtMs = System.currentTimeMillis();
-        List<MediaItem> items = new ArrayList<>();
+
+    private String find(Pattern p, String text, int groupIdx) {
+        Matcher m = p.matcher(text);
+        return m.find() ? m.group(groupIdx) : null;
+    }
+
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static String encode(String s) {
+        return URLEncoder.encode(s, StandardCharsets.UTF_8);
+    }
+
+    private static String firstNonBlank(String a, String b) {
+        if (a != null && !a.isBlank()) return a;
+        return b;
+    }
+
+    // Обратная совместимость: у старых записей может быть только fileId.
+    public static class MediaItem {
+        public String type;
+        public String fileId;
+        public String token;
+        public String url;
+
+        public MediaItem() {
+        }
+
+        public MediaItem(String type, String fileId, String token, String url) {
+            this.type = type;
+            this.fileId = fileId;
+            this.token = token;
+            this.url = url;
+        }
     }
 }
