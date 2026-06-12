@@ -11,6 +11,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 
 /**
  * Клиент для API статусов Итигрис:
@@ -19,11 +20,15 @@ import java.nio.charset.StandardCharsets;
  */
 public class ItigrisClient {
     private static final Logger log = LoggerFactory.getLogger(ItigrisClient.class);
+    private static final Duration HTTP_CONNECT_TIMEOUT = Duration.ofSeconds(10);
+    private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(20);
 
     private final String base;
     private final String client;
     private final String apiKey;
-    private final HttpClient http = HttpClient.newHttpClient();
+    private final HttpClient http = HttpClient.newBuilder()
+            .connectTimeout(HTTP_CONNECT_TIMEOUT)
+            .build();
     private final ObjectMapper mapper = new ObjectMapper();
 
     public ItigrisClient(String base, String client, String apiKey) {
@@ -39,9 +44,14 @@ public class ItigrisClient {
                     URLEncoder.encode(apiKey, StandardCharsets.UTF_8),
                     URLEncoder.encode(orderNumber, StandardCharsets.UTF_8));
             HttpRequest req = HttpRequest.newBuilder(URI.create(url))
-                    .GET().header("Accept", "application/json, text/plain, */*")
+                    .GET()
+                    .header("Accept", "application/json, text/plain, */*")
+                    .timeout(REQUEST_TIMEOUT)
                     .build();
             HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
+            if (res.statusCode() < 200 || res.statusCode() >= 300) {
+                log.warn("Itigris status fetch returned non-2xx for {}: code={}", orderNumber, res.statusCode());
+            }
             String body = res.body();
             String ct = res.headers().firstValue("content-type").orElse("");
 

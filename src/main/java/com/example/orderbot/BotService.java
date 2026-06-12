@@ -12,6 +12,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -30,13 +31,18 @@ public class BotService {
     private static final Logger log = LoggerFactory.getLogger(BotService.class);
 
     private static final String MAX_API_BASE = "https://platform-api.max.ru";
+    private static final Duration HTTP_CONNECT_TIMEOUT = Duration.ofSeconds(10);
+    private static final Duration UPDATES_TIMEOUT = Duration.ofSeconds(40);
+    private static final Duration SEND_TIMEOUT = Duration.ofSeconds(20);
 
     private final String token;
     private final OrderRepository repo;
     private final ZoneId zone;
     private final ItigrisClient itigris;
 
-    private final HttpClient http = HttpClient.newHttpClient();
+    private final HttpClient http = HttpClient.newBuilder()
+            .connectTimeout(HTTP_CONNECT_TIMEOUT)
+            .build();
     private final ObjectMapper mapper = new ObjectMapper();
     private final ExecutorService pollingExecutor = Executors.newSingleThreadExecutor();
 
@@ -61,25 +67,24 @@ public class BotService {
         log.info("MAX bot polling started (apiBase={}, updatesType=message_created)", MAX_API_BASE);
     }
 
-    public void sendToGroup(long chatId, String text) {
-        sendMessage(chatId, text, null);
+    public boolean sendToGroup(long chatId, String text) {
+        return sendMessage(chatId, text, null);
     }
 
-    public void sendPhotoToGroup(long chatId, String fileIdOrToken, String captionHtml) {
+    public boolean sendPhotoToGroup(long chatId, String fileIdOrToken, String captionHtml) {
         List<Object> attachments = new ArrayList<>();
         attachments.add(imageAttachment(fileIdOrToken, null));
-        sendMessage(chatId, captionHtml, attachments);
+        return sendMessage(chatId, captionHtml, attachments);
     }
 
-    public void sendReminderWithMedia(Order o, String captionHtml) {
+    public boolean sendReminderWithMedia(Order o, String captionHtml) {
         List<MediaItem> media = parseMediaJson(o.mediaJson());
         long chatId = o.groupChatId();
         log.info("Preparing reminder send: order={}, chatId={}, mediaItems={}", o.orderNumber(), chatId, media.size());
 
         if (media.isEmpty()) {
-            if (o.photoFileId() != null) sendPhotoToGroup(chatId, o.photoFileId(), captionHtml);
-            else sendToGroup(chatId, captionHtml);
-            return;
+            if (o.photoFileId() != null) return sendPhotoToGroup(chatId, o.photoFileId(), captionHtml);
+            return sendToGroup(chatId, captionHtml);
         }
 
         List<Object> attachments = new ArrayList<>();
@@ -93,9 +98,9 @@ public class BotService {
         }
 
         if (attachments.isEmpty()) {
-            sendToGroup(chatId, captionHtml);
+            return sendToGroup(chatId, captionHtml);
         } else {
-            sendMessage(chatId, captionHtml, attachments);
+            return sendMessage(chatId, captionHtml, attachments);
         }
     }
 
@@ -136,6 +141,7 @@ public class BotService {
                 .GET()
                 .header("Authorization", token)
                 .header("Accept", "application/json")
+                .timeout(UPDATES_TIMEOUT)
                 .build();
 
         HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
@@ -146,7 +152,7 @@ public class BotService {
         throw new IllegalStateException("MAX /updates failed: HTTP " + code + ", body=" + res.body());
     }
 
-    private void sendMessage(long chatId, String text, List<Object> attachments) {
+    private boolean sendMessage(long chatId, String text, List<Object> attachments) {
         try {
             String url = MAX_API_BASE + "/messages?chat_id=" + chatId;
 
@@ -161,6 +167,7 @@ public class BotService {
             HttpRequest req = HttpRequest.newBuilder(URI.create(url))
                     .header("Authorization", token)
                     .header("Content-Type", "application/json")
+                    .timeout(SEND_TIMEOUT)
                     .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
                     .build();
 
@@ -168,13 +175,15 @@ public class BotService {
             int code = res.statusCode();
             if (code < 200 || code >= 300) {
                 log.warn("MAX sendMessage failed: chatId={}, code={}, body={}", chatId, code, res.body());
-            } else {
-                int attachmentsCount = attachments == null ? 0 : attachments.size();
-                log.info("MAX message sent: chatId={}, code={}, textLen={}, attachments={}",
-                        chatId, code, text == null ? 0 : text.length(), attachmentsCount);
+                return false;
             }
+            int attachmentsCount = attachments == null ? 0 : attachments.size();
+            log.info("MAX message sent: chatId={}, code={}, textLen={}, attachments={}",
+                    chatId, code, text == null ? 0 : text.length(), attachmentsCount);
+            return true;
         } catch (Exception e) {
             log.warn("MAX sendMessage error: {}", e.toString());
+            return false;
         }
     }
 

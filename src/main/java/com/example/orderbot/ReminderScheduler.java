@@ -85,15 +85,23 @@ public class ReminderScheduler {
                 if (inHardWindow) {
                     log.info("Reminder due now: orderId={}, order={}, chatId={}, dueAt={}, remindWindow=[{}, {}]",
                             o.id(), o.orderNumber(), o.groupChatId(), o.dueAtEpochSec(), w.startEpoch, w.endEpoch);
+                    log.info("Fetching Itigris status for reminder: orderId={}, order={}", o.id(), o.orderNumber());
                     String status = itigris.fetchStatusByOrderId(o.orderNumber());
+                    log.info("Itigris status fetched for reminder: orderId={}, order={}, status='{}'",
+                            o.id(), o.orderNumber(), status);
                     repo.updateStatus(o.id(), status);
 
                     String caption = MessageTemplates.reminder(o, status, zone);
-                    bot.sendReminderWithMedia(o, caption);
+                    boolean delivered = bot.sendReminderWithMedia(o, caption);
 
-                    repo.markReminderSent(o.id());
-                    log.info("Reminder sent: orderId={}, order={}, chatId={}", o.id(), o.orderNumber(), o.groupChatId());
-                    sent++;
+                    if (delivered) {
+                        repo.markReminderSent(o.id());
+                        log.info("Reminder sent: orderId={}, order={}, chatId={}", o.id(), o.orderNumber(), o.groupChatId());
+                        sent++;
+                    } else {
+                        log.warn("Reminder delivery failed, will retry on next scheduler tick: orderId={}, order={}, chatId={}",
+                                o.id(), o.orderNumber(), o.groupChatId());
+                    }
                 } else {
                     log.info("Reminder skipped (outside hard window): orderId={}, order={}, chatId={}, remindWindow=[{}, {}], now={}",
                             o.id(), o.orderNumber(), o.groupChatId(), w.startEpoch, w.endEpoch, nowSec);
