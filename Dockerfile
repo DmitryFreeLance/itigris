@@ -38,12 +38,20 @@ ENV DB_PATH=/data/bot.db \
     TZ=Asia/Yekaterinburg \
     SCAN_INTERVAL_MINUTES=15 \
     REMINDER_WINDOW_MINUTES=60 \
-    REMINDER_LEAD_HOURS=72
+    REMINDER_LEAD_HOURS=72 \
+    JAVA_TOOL_OPTIONS="-Djava.net.preferIPv4Stack=true -Djava.net.preferIPv6Addresses=false"
 
-# Эти — обязательные, задаются при запуске:
+# Эти задаются при запуске:
 # - BOT_TOKEN
-# - ITIGRIS_CLIENT
-# - ITIGRIS_API_KEY
+# - один из вариантов интеграции с Itigris:
+#   legacy:
+#   - ITIGRIS_CLIENT
+#   - ITIGRIS_API_KEY
+#   v2:
+#   - ITIGRIS_V2_COMPANY
+#   - ITIGRIS_V2_LOGIN
+#   - ITIGRIS_V2_PASSWORD
+#   - ITIGRIS_V2_DEPARTMENT_ID
 
 # Если планируете healthcheck — можно добавить curl/jq и тут прописать проверку
 
