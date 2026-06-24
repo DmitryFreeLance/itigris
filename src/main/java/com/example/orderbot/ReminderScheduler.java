@@ -24,6 +24,8 @@ public class ReminderScheduler {
     private final int scanEveryMin;
     private final int windowMin;            // прежний параметр оставить — пригодится для "мягкой" доставки при тиках
     private final double leadHours;         // за сколько часов до due слать (обычно 72)
+    private final double repeatIntervalHours;
+    private final int repeatMaxAgeDays;
     private final int windowStartHourLocal; // начало окна (локальное), по умолчанию 8
     private final int windowEndHourLocal;   // конец окна (локальное), по умолчанию 10
 
@@ -36,6 +38,8 @@ public class ReminderScheduler {
                              int scanEveryMin,
                              int windowMin,
                              double leadHours,
+                             double repeatIntervalHours,
+                             int repeatMaxAgeDays,
                              int windowStartHourLocal,
                              int windowEndHourLocal) {
         this.repo = repo;
@@ -45,14 +49,17 @@ public class ReminderScheduler {
         this.scanEveryMin = scanEveryMin;
         this.windowMin = windowMin;
         this.leadHours = leadHours;
+        this.repeatIntervalHours = repeatIntervalHours;
+        this.repeatMaxAgeDays = repeatMaxAgeDays;
         this.windowStartHourLocal = windowStartHourLocal;
         this.windowEndHourLocal = windowEndHourLocal;
     }
 
     public void start() {
         ses.scheduleAtFixedRate(this::tick, 0, scanEveryMin, TimeUnit.MINUTES);
-        log.info("Reminder scheduler started: scanEvery={}m, softWindow=±{}m, leadHours={}, hardWindow={}–{} (zone={})",
-                scanEveryMin, windowMin, leadHours, windowStartHourLocal, windowEndHourLocal, zone);
+        log.info("Reminder scheduler started: scanEvery={}m, softWindow=±{}m, leadHours={}, repeatEvery={}h, repeatMaxAgeDays={}, hardWindow={}–{} (zone={})",
+                scanEveryMin, windowMin, leadHours, repeatIntervalHours, repeatMaxAgeDays,
+                windowStartHourLocal, windowEndHourLocal, zone);
     }
 
     private void tick() {
@@ -83,13 +90,15 @@ public class ReminderScheduler {
                 boolean inHardWindow = (nowSec >= w.startEpoch) && (nowSec <= w.endEpoch);
 
                 if (inHardWindow) {
-                    log.info("Reminder due now: orderId={}, order={}, chatId={}, dueAt={}, remindWindow=[{}, {}]",
+                    log.info("Initial reminder due now: orderId={}, order={}, chatId={}, dueAt={}, remindWindow=[{}, {}]",
                             o.id(), o.orderNumber(), o.groupChatId(), o.dueAtEpochSec(), w.startEpoch, w.endEpoch);
-                    log.info("Fetching Itigris status for reminder: orderId={}, order={}", o.id(), o.orderNumber());
-                    String status = itigris.fetchStatusByOrderId(o.orderNumber());
-                    log.info("Itigris status fetched for reminder: orderId={}, order={}, status='{}'",
-                            o.id(), o.orderNumber(), status);
-                    repo.updateStatus(o.id(), status);
+                    String status = fetchAndStoreStatus(o);
+                    if (isIssuedStatus(status)) {
+                        repo.markReminderInitialized(o.id());
+                        log.info("Initial reminder skipped because order already issued: orderId={}, order={}, status='{}'",
+                                o.id(), o.orderNumber(), status);
+                        continue;
+                    }
 
                     String caption = MessageTemplates.reminder(o, status, zone);
                     boolean delivered = bot.sendReminderWithMedia(o, caption);
@@ -99,7 +108,7 @@ public class ReminderScheduler {
                         log.info("Reminder sent: orderId={}, order={}, chatId={}", o.id(), o.orderNumber(), o.groupChatId());
                         sent++;
                     } else {
-                        log.warn("Reminder delivery failed, will retry on next scheduler tick: orderId={}, order={}, chatId={}",
+                        log.warn("Initial reminder delivery failed, will retry on next scheduler tick: orderId={}, order={}, chatId={}",
                                 o.id(), o.orderNumber(), o.groupChatId());
                     }
                 } else {
@@ -108,10 +117,65 @@ public class ReminderScheduler {
                 }
             }
 
-            log.info("Scheduler tick finished: sent={}, candidates={}", sent, candidates.size());
+            int repeatSent = processRepeatReminders(nowSec);
+            log.info("Scheduler tick finished: initialSent={}, repeatSent={}, candidates={}", sent, repeatSent, candidates.size());
         } catch (Exception e) {
             log.error("Scheduler tick error", e);
         }
+    }
+
+    private int processRepeatReminders(long nowSec) throws Exception {
+        long repeatIntervalSec = (long) (repeatIntervalHours * 3600L);
+        long lastSentCutoff = nowSec - repeatIntervalSec;
+        Long dueAfterCutoff = repeatMaxAgeDays > 0 ? nowSec - repeatMaxAgeDays * 24L * 3600L : null;
+
+        List<Order> candidates = repo.findRepeatReminderCandidates(lastSentCutoff, dueAfterCutoff);
+        int sent = 0;
+        for (Order o : candidates) {
+            if (isIssuedStatus(o.lastKnownStatus())) {
+                continue;
+            }
+
+            String status = fetchAndStoreStatus(o);
+            if (isIssuedStatus(status)) {
+                log.info("Repeat reminders stopped because order is issued: orderId={}, order={}, status='{}'",
+                        o.id(), o.orderNumber(), status);
+                continue;
+            }
+
+            boolean delivered = bot.sendReminderWithMedia(o, MessageTemplates.reminder(o, status, zone));
+            if (delivered) {
+                repo.markRepeatReminderSent(o.id());
+                log.info("Repeat reminder sent: orderId={}, order={}, chatId={}, intervalHours={}",
+                        o.id(), o.orderNumber(), o.groupChatId(), repeatIntervalHours);
+                sent++;
+            } else {
+                log.warn("Repeat reminder delivery failed, will retry later: orderId={}, order={}, chatId={}",
+                        o.id(), o.orderNumber(), o.groupChatId());
+            }
+        }
+        return sent;
+    }
+
+    private String fetchAndStoreStatus(Order o) throws Exception {
+        log.info("Fetching Itigris status for reminder: orderId={}, order={}", o.id(), o.orderNumber());
+        String status = itigris.fetchStatusByOrderId(o.orderNumber());
+        log.info("Itigris status fetched for reminder: orderId={}, order={}, status='{}'",
+                o.id(), o.orderNumber(), status);
+        repo.updateStatus(o.id(), status);
+        return status;
+    }
+
+    private boolean isIssuedStatus(String status) {
+        if (status == null || status.isBlank()) {
+            return false;
+        }
+        String normalized = status.toLowerCase()
+                .replace('ё', 'е')
+                .replaceAll("[^\\p{IsAlphabetic}\\p{IsDigit}]+", " ")
+                .trim()
+                .replaceAll("\\s+", " ");
+        return normalized.contains("заказ выдан");
     }
 
     /** Вычисляет окно 08:00–10:00 (или заданные часы) локального дня для (due - leadHours). */

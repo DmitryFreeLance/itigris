@@ -10,6 +10,7 @@ public record Order(
         Long groupChatId,
         String photoFileId,          // legacy: одна фотка (оставляем для совместимости)
         boolean reminder72hSent,
+        Long lastReminderSentAtEpochSec,
         String lastKnownStatus,
         Long lastStatusCheckEpochSec,
         long createdAtEpochSec,
@@ -17,7 +18,7 @@ public record Order(
         String mediaJson             // НОВОЕ: JSON-массив медиа [{type:"photo|video", fileId:"..."}]
 ) {
     public static Order ofNew(String number, String dep, long due, Long chatId, String photoId, Long triggerAt, String mediaJson) {
-        return new Order(null, number, dep, due, chatId, photoId, false, null, null,
+        return new Order(null, number, dep, due, chatId, photoId, false, null, null, null,
                 Instant.now().getEpochSecond(), triggerAt, mediaJson);
     }
 }

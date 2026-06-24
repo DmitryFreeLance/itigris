@@ -41,6 +41,8 @@ public class Main {
         final int    SCAN_INTERVAL_MIN   = intEnv("SCAN_INTERVAL_MINUTES", 15);
         final int    REMINDER_WINDOW_MIN = intEnv("REMINDER_WINDOW_MINUTES", 60); // мягкое окно для тиков (не жёсткое)
         final double REMINDER_LEAD_HOURS = doubleEnv("REMINDER_LEAD_HOURS", 72.0);
+        final double REPEAT_REMINDER_INTERVAL_HOURS = doubleEnv("REPEAT_REMINDER_INTERVAL_HOURS", 24.0);
+        final int    REPEAT_REMINDER_MAX_AGE_DAYS = intEnv("REPEAT_REMINDER_MAX_AGE_DAYS", 30);
 
         // Новые параметры: "жёсткое" окно 08:00–10:00 локально для даты (due - lead)
         final int    REMIND_WINDOW_START_HOUR = intEnv("REMIND_WINDOW_START_HOUR", 8);
@@ -82,6 +84,8 @@ public class Main {
                 repo, itigris, bot, zoneId,
                 SCAN_INTERVAL_MIN, REMINDER_WINDOW_MIN,
                 REMINDER_LEAD_HOURS,
+                REPEAT_REMINDER_INTERVAL_HOURS,
+                REPEAT_REMINDER_MAX_AGE_DAYS,
                 REMIND_WINDOW_START_HOUR,
                 REMIND_WINDOW_END_HOUR
         );

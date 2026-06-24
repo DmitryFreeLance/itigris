@@ -288,7 +288,7 @@ public class BotService {
             log.info("Order saved: id={}, chatId={}, order={}, dueEpoch={}", id, chatId, number, due);
 
             Order saved = new Order(id, o.orderNumber(), o.department(), o.dueAtEpochSec(), o.groupChatId(),
-                    o.photoFileId(), o.reminder72hSent(), o.lastKnownStatus(), o.lastStatusCheckEpochSec(),
+                    o.photoFileId(), o.reminder72hSent(), o.lastReminderSentAtEpochSec(), o.lastKnownStatus(), o.lastStatusCheckEpochSec(),
                     o.createdAtEpochSec(), o.triggerAtEpochSec(), o.mediaJson());
             sendToGroup(chatId, MessageTemplates.confirmSaved(saved, zone));
             return;
@@ -313,7 +313,7 @@ public class BotService {
                         id, chatId, number.trim(), due, media.size());
 
                 Order saved = new Order(id, o.orderNumber(), o.department(), o.dueAtEpochSec(), o.groupChatId(),
-                        o.photoFileId(), o.reminder72hSent(), o.lastKnownStatus(), o.lastStatusCheckEpochSec(),
+                        o.photoFileId(), o.reminder72hSent(), o.lastReminderSentAtEpochSec(), o.lastKnownStatus(), o.lastStatusCheckEpochSec(),
                         o.createdAtEpochSec(), o.triggerAtEpochSec(), o.mediaJson());
                 sendToGroup(chatId, MessageTemplates.confirmSaved(saved, zone));
             }

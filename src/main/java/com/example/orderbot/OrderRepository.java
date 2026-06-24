@@ -6,8 +6,10 @@ import org.slf4j.LoggerFactory;
 import java.sql.*;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 public class OrderRepository {
     private static final Logger log = LoggerFactory.getLogger(OrderRepository.class);
@@ -31,6 +33,7 @@ public class OrderRepository {
                       group_chat_id INTEGER NOT NULL,
                       photo_file_id TEXT,
                       reminder72h_sent INTEGER NOT NULL DEFAULT 0,
+                      last_reminder_sent_at INTEGER,
                       last_status   TEXT,
                       last_status_check_at INTEGER,
                       created_at    INTEGER NOT NULL,
@@ -40,6 +43,9 @@ public class OrderRepository {
                 """);
                 st.execute("CREATE INDEX IF NOT EXISTS idx_due_at ON orders(due_at)");
                 st.execute("CREATE INDEX IF NOT EXISTS idx_order_number ON orders(order_number)");
+                ensureColumnExists(c, "orders", "last_reminder_sent_at",
+                        "ALTER TABLE orders ADD COLUMN last_reminder_sent_at INTEGER");
+                backfillLastReminderSentAt(c);
 
                 // --- Авто-дедупликация перед созданием UNIQUE ---
                 // Оставляем самую свежую запись (MAX(id)) в каждой группе (chat, order_number, due_at)
@@ -94,11 +100,35 @@ public class OrderRepository {
         }
     }
 
+    private void ensureColumnExists(Connection c, String table, String column, String alterSql) throws SQLException {
+        Set<String> columns = new HashSet<>();
+        try (Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery("PRAGMA table_info(" + table + ")")) {
+            while (rs.next()) {
+                columns.add(rs.getString("name"));
+            }
+        }
+        if (!columns.contains(column)) {
+            try (Statement st = c.createStatement()) {
+                st.execute(alterSql);
+            }
+        }
+    }
+
+    private void backfillLastReminderSentAt(Connection c) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "UPDATE orders SET last_reminder_sent_at=? " +
+                        "WHERE reminder72h_sent=1 AND last_reminder_sent_at IS NULL")) {
+            ps.setLong(1, Instant.now().getEpochSecond());
+            ps.executeUpdate();
+        }
+    }
+
     public long insert(Order o) throws SQLException {
         String sql = """
             INSERT INTO orders(order_number,department,due_at,group_chat_id,photo_file_id,
-                               reminder72h_sent,last_status,last_status_check_at,created_at,trigger_at,media_json)
-            VALUES(?,?,?,?,?,0,NULL,NULL,?,?,?)
+                               reminder72h_sent,last_reminder_sent_at,last_status,last_status_check_at,created_at,trigger_at,media_json)
+            VALUES(?,?,?,?,?,0,NULL,NULL,NULL,?,?,?)
         """;
         try (Connection c = DriverManager.getConnection(jdbcUrl);
              PreparedStatement ps = c.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
@@ -163,8 +193,29 @@ public class OrderRepository {
     public void markReminderSent(long id) throws SQLException {
         try (Connection c = DriverManager.getConnection(jdbcUrl);
              PreparedStatement ps = c.prepareStatement(
-                     "UPDATE orders SET reminder72h_sent=1, trigger_at=NULL WHERE id=?")) {
-            ps.setLong(1, id);
+                     "UPDATE orders SET reminder72h_sent=1, last_reminder_sent_at=?, trigger_at=NULL WHERE id=?")) {
+            ps.setLong(1, Instant.now().getEpochSecond());
+            ps.setLong(2, id);
+            ps.executeUpdate();
+        }
+    }
+
+    public void markReminderInitialized(long id) throws SQLException {
+        try (Connection c = DriverManager.getConnection(jdbcUrl);
+             PreparedStatement ps = c.prepareStatement(
+                     "UPDATE orders SET reminder72h_sent=1, last_reminder_sent_at=?, trigger_at=NULL WHERE id=?")) {
+            ps.setLong(1, Instant.now().getEpochSecond());
+            ps.setLong(2, id);
+            ps.executeUpdate();
+        }
+    }
+
+    public void markRepeatReminderSent(long id) throws SQLException {
+        try (Connection c = DriverManager.getConnection(jdbcUrl);
+             PreparedStatement ps = c.prepareStatement(
+                     "UPDATE orders SET last_reminder_sent_at=? WHERE id=?")) {
+            ps.setLong(1, Instant.now().getEpochSecond());
+            ps.setLong(2, id);
             ps.executeUpdate();
         }
     }
@@ -198,8 +249,33 @@ public class OrderRepository {
         return list;
     }
 
+    public List<Order> findRepeatReminderCandidates(long sentBeforeEpochSec, Long dueAfterEpochSec) throws SQLException {
+        StringBuilder sql = new StringBuilder("""
+            SELECT * FROM orders
+             WHERE reminder72h_sent=1
+               AND last_reminder_sent_at IS NOT NULL
+               AND last_reminder_sent_at <= ?
+        """);
+        if (dueAfterEpochSec != null) {
+            sql.append(" AND due_at >= ?");
+        }
+        List<Order> list = new ArrayList<>();
+        try (Connection c = DriverManager.getConnection(jdbcUrl);
+             PreparedStatement ps = c.prepareStatement(sql.toString())) {
+            ps.setLong(1, sentBeforeEpochSec);
+            if (dueAfterEpochSec != null) {
+                ps.setLong(2, dueAfterEpochSec);
+            }
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) list.add(map(rs));
+            }
+        }
+        return list;
+    }
+
     private Order map(ResultSet rs) throws SQLException {
         Long trig = rs.getObject("trigger_at") == null ? null : rs.getLong("trigger_at");
+        Long lastReminderSentAt = rs.getObject("last_reminder_sent_at") == null ? null : rs.getLong("last_reminder_sent_at");
         String media = rs.getString("media_json");
         return new Order(
                 rs.getLong("id"),
@@ -209,6 +285,7 @@ public class OrderRepository {
                 rs.getLong("group_chat_id"),
                 rs.getString("photo_file_id"),
                 rs.getInt("reminder72h_sent") == 1,
+                lastReminderSentAt,
                 rs.getString("last_status"),
                 rs.getLong("last_status_check_at"),
                 rs.getLong("created_at"),
