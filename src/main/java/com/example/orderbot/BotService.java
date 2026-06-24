@@ -30,7 +30,7 @@ import java.util.regex.Pattern;
 public class BotService {
     private static final Logger log = LoggerFactory.getLogger(BotService.class);
 
-    private static final String MAX_API_BASE = "https://platform-api.max.ru";
+    private static final String MAX_API_BASE = envOrDefault("MAX_API_BASE", "https://platform-api2.max.ru");
     private static final Duration HTTP_CONNECT_TIMEOUT = Duration.ofSeconds(10);
     private static final Duration UPDATES_TIMEOUT = Duration.ofSeconds(40);
     private static final Duration SEND_TIMEOUT = Duration.ofSeconds(20);
@@ -379,6 +379,11 @@ public class BotService {
     private static String firstNonBlank(String a, String b) {
         if (a != null && !a.isBlank()) return a;
         return b;
+    }
+
+    private static String envOrDefault(String key, String def) {
+        String value = System.getenv(key);
+        return (value == null || value.isBlank()) ? def : value;
     }
 
     private static String shortText(String s) {

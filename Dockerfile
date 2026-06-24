@@ -27,6 +27,9 @@ WORKDIR /opt/order-bot
 # (опционально) корректные TZ в образе
 RUN apt-get update && apt-get install -y --no-install-recommends tzdata && rm -rf /var/lib/apt/lists/*
 
+# Сертификаты Минцифры для доступа к MAX API.
+COPY certs/ /certificates/
+
 # Кладём JAR
 COPY --from=build /tmp/app.jar ./app.jar
 
@@ -39,6 +42,7 @@ ENV DB_PATH=/data/bot.db \
     SCAN_INTERVAL_MINUTES=15 \
     REMINDER_WINDOW_MINUTES=60 \
     REMINDER_LEAD_HOURS=72 \
+    USE_SYSTEM_CA_CERTS=1 \
     JAVA_TOOL_OPTIONS="-Djava.net.preferIPv4Stack=true -Djava.net.preferIPv6Addresses=false"
 
 # Эти задаются при запуске:
@@ -56,4 +60,4 @@ ENV DB_PATH=/data/bot.db \
 # Если планируете healthcheck — можно добавить curl/jq и тут прописать проверку
 
 # Запуск
-ENTRYPOINT ["java","-jar","/opt/order-bot/app.jar"]
+ENTRYPOINT ["/__cacert_entrypoint.sh","java","-jar","/opt/order-bot/app.jar"]
