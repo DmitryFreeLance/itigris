@@ -86,8 +86,7 @@ public class ReminderScheduler {
             int sent = 0;
             for (Order o : candidates) {
                 Window w = computeRemindWindow(o.dueAtEpochSec());
-                // Жёсткое окно 08:00–10:00 локально
-                boolean inHardWindow = (nowSec >= w.startEpoch) && (nowSec <= w.endEpoch);
+                boolean inHardWindow = isInWindow(nowSec, w);
 
                 if (inHardWindow) {
                     log.info("Initial reminder due now: orderId={}, order={}, chatId={}, dueAt={}, remindWindow=[{}, {}]",
@@ -143,6 +142,13 @@ public class ReminderScheduler {
                 continue;
             }
 
+            Window w = computeRemindWindow(o.dueAtEpochSec());
+            if (!isInWindow(nowSec, w)) {
+                log.info("Repeat reminder skipped (outside hard window): orderId={}, order={}, chatId={}, remindWindow=[{}, {}], now={}",
+                        o.id(), o.orderNumber(), o.groupChatId(), w.startEpoch, w.endEpoch, nowSec);
+                continue;
+            }
+
             boolean delivered = bot.sendReminderWithMedia(o, MessageTemplates.reminder(o, status, zone));
             if (delivered) {
                 repo.markRepeatReminderSent(o.id());
@@ -192,6 +198,10 @@ public class ReminderScheduler {
             end = end.plusDays(1);
         }
         return new Window(start.toEpochSecond(), end.toEpochSecond());
+    }
+
+    private boolean isInWindow(long nowSec, Window window) {
+        return nowSec >= window.startEpoch && nowSec <= window.endEpoch;
     }
 
     private record Window(long startEpoch, long endEpoch) {}
